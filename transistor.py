@@ -1,0 +1,888 @@
+
+import math
+import base64
+
+import numpy as np
+import plotly.graph_objects as go
+import streamlit as st
+
+import matplotlib
+matplotlib.use("Agg")
+import schemdraw
+import schemdraw.elements as elm
+
+schemdraw.use("matplotlib")
+
+# ─── Units used throughout: volts (V), milliamps (mA), kilo-ohms (kΩ) ─────────
+VT = 0.025          # thermal voltage (V), Sedra & Smith convention
+BETA_R = 0.1        # reverse beta of the BJT (only shapes the saturation region)
+
+# Region → colour class.  "amp" = the region where the device amplifies.
+CLASS_COLOR = {"amp": "#1f9d55", "ohmic": "#d97706", "off": "#8a949e"}
+
+
+# ─── MOSFET: square-law model (written in n-type coordinates, all positive) ────
+def mos_id(vgs, vds, P):
+    """Drain current (mA). Triode carries the (1+λv_DS) factor too, so the
+    curve is continuous at the edge of saturation."""
+    vgs = np.asarray(vgs, dtype=float)
+    vds = np.asarray(vds, dtype=float)
+    vov = vgs - P["Vt"]
+    on = (vov > 0) & (vds > 0)
+    tri = P["k"] * (vov * vds - 0.5 * vds ** 2) * (1 + P["lam"] * vds)
+    sat = 0.5 * P["k"] * vov ** 2 * (1 + P["lam"] * vds)
+    i = np.where(vds < vov, tri, sat)
+    return np.where(on, i, 0.0)
+
+
+def mos_region(vgs, vds, P):
+    vov = vgs - P["Vt"]
+    if vov <= 0:
+        return "cutoff"
+    return "triode" if vds < vov else "saturation"
+
+
+def solve_mos_n(c, P):
+    """n-type bias circuit: drain –R_D– V_DD, source –R_S– V_X, gate at V_G.
+    No gate current, so one unknown (I_D) solved by bisection."""
+    def f(I):
+        return float(mos_id(c["VG"] - c["VX"] - I * c["RS"],
+                            c["VDD"] - I * c["RD"] - c["VX"] - I * c["RS"], P))
+    f0 = f(0.0)
+    I = 0.0
+    if f0 > 0:
+        lo, hi = 0.0, f0
+        for _ in range(80):
+            m = 0.5 * (lo + hi)
+            if m - f(m) > 0:
+                hi = m
+            else:
+                lo = m
+        I = 0.5 * (lo + hi)
+    VD = c["VDD"] - I * c["RD"]
+    VS = c["VX"] + I * c["RS"]
+    VGS, VDS = c["VG"] - VS, VD - VS
+    return dict(I=I, VG=c["VG"], VD=VD, VS=VS, VGS=VGS, VDS=VDS,
+                region=mos_region(VGS, VDS, P))
+
+
+# ─── BJT: Ebers–Moll transport model + Early effect (npn coordinates) ─────────
+def _exp_lim(v):
+    vm = 1.2
+    return math.exp(vm / VT) * (1 + (v - vm) / VT) if v > vm else math.exp(v / VT)
+
+
+def bjt_currents(vbe, vbc, P):
+    eBE, eBC = _exp_lim(vbe), _exp_lim(vbc)
+    vce = max(vbe - vbc, 0.0)
+    ic = P["IS"] * (eBE - eBC) * (1 + vce / P["VA"]) - (P["IS"] / BETA_R) * (eBC - 1)
+    ib = (P["IS"] / P["beta"]) * (eBE - 1) + (P["IS"] / BETA_R) * (eBC - 1)
+    return ic, ib
+
+
+def bjt_region(vbe, vbc):
+    if vbc > 0.4:
+        return "saturation"
+    if vbe < 0.5:
+        return "cutoff"
+    return "active"
+
+
+def solve_bjt_n(c, P, x0=None):
+    """npn bias circuit: collector –R_C– V_CC, emitter –R_E– V_X, base –R_B– V_B.
+    Damped Newton on the three node voltages (B, E, C)."""
+    RB, RC, RE = max(c["RB"], 1e-3), max(c["RC"], 1e-3), max(c["RE"], 1e-3)
+
+    def F(x):
+        B, E, C = x
+        ic, ib = bjt_currents(B - E, B - C, P)
+        return np.array([(c["VB"] - B) / RB - ib,
+                         (c["VCC"] - C) / RC - ic,
+                         (E - c["VX"]) / RE - ib - ic])
+
+    x = np.array(x0, dtype=float) if x0 is not None else \
+        np.array([min(c["VB"], c["VX"] + 0.6), c["VX"], c["VCC"]])
+    for _ in range(400):
+        f = F(x)
+        J = np.empty((3, 3))
+        h = 1e-7
+        for j in range(3):
+            xp = x.copy()
+            xp[j] += h
+            J[:, j] = (F(xp) - f) / h
+        try:
+            d = np.linalg.solve(J, -f)
+        except np.linalg.LinAlgError:
+            break
+        m = np.max(np.abs(d))
+        s = 0.1 / m if m > 0.1 else 1.0
+        x = x + s * d
+        if m * s < 1e-10:
+            break
+    B, E, C = x
+    ic, ib = bjt_currents(B - E, B - C, P)
+    return dict(I=ic, IB=ib, IE=ic + ib, VG=B, VD=C, VS=E, VGS=B - E, VDS=C - E,
+                VBC=B - C, region=bjt_region(B - E, B - C), x=x)
+
+
+# ─── Amplifier circuits in real (signed) node voltages ────────────────────────
+def solve_amp(fam, pol, cfg, s, P, warm=None):
+    """s: VDD, Rd, Rs, RB, vI, VBIAS (Rd/Rs = drain/collector and source/emitter
+    resistors).  A p-type circuit is solved as its n-type mirror image
+    (every node voltage V ↦ V_DD − V)."""
+    VDD = s["VDD"]
+    n = pol == "n"
+    ctl = s["VBIAS"] if cfg == "CG" else s["vI"]
+    X = s["vI"] if cfg == "CG" else (0.0 if n else VDD)   # where R_S / R_E returns
+    tr = (lambda v: v) if n else (lambda v: VDD - v)
+    if fam == "MOS":
+        r = solve_mos_n(dict(VDD=VDD, RD=s["Rd"], RS=s["Rs"], VG=tr(ctl), VX=tr(X)), P)
+    else:
+        r = solve_bjt_n(dict(VCC=VDD, RC=s["Rd"], RE=s["Rs"], RB=s["RB"], VB=tr(ctl), VX=tr(X)),
+                        P, warm)
+    out = dict(r)
+    out["VG"], out["VD"], out["VS"] = tr(r["VG"]), tr(r["VD"]), tr(r["VS"])
+    out["vO"] = out["VS"] if cfg == "CD" else out["VD"]
+    out["Vint"] = VDD - tr(X)          # supply seen by the drain–source loop
+    return out
+
+
+def region_class(fam, region):
+    if region == "cutoff":
+        return "off"
+    if fam == "MOS":
+        return "amp" if region == "saturation" else "ohmic"
+    return "amp" if region == "active" else "ohmic"
+
+
+# ─── Formatting helpers ───────────────────────────────────────────────────────
+def fmt_I(i_mA):
+    a = abs(i_mA)
+    if a >= 0.1:
+        return f"{i_mA:.3f} mA"
+    if a >= 1e-3:
+        return f"{i_mA * 1e3:.2f} µA"
+    if a >= 1e-6:
+        return f"{i_mA * 1e6:.2f} nA"
+    return "≈ 0"
+
+
+def fmt_R(r_k):
+    if not math.isfinite(r_k):
+        return "∞"
+    return f"{r_k:.2f} kΩ" if r_k < 1000 else f"{r_k / 1000:.2f} MΩ"
+
+
+def hsub(u):
+    """'V_EC' -> 'V<sub>EC</sub>' for plot labels."""
+    a, _, b = u.partition("_")
+    return f"{a}<sub>{b}</sub>" if b else a
+
+
+def region_box(fam, region, text):
+    cls = region_class(fam, region)
+    {"amp": st.success, "ohmic": st.warning, "off": st.info}[cls](text)
+
+
+def svg_html(d, width=330):
+    data = d.get_imagedata("svg")
+    b64 = base64.b64encode(data).decode()
+    return f'<img src="data:image/svg+xml;base64,{b64}" style="width:{width}px;max-width:100%">'
+
+
+# ─── Names that depend on device family and polarity ──────────────────────────
+def names(fam, pol):
+    p = pol == "p"
+    if fam == "MOS":
+        return dict(dev="PMOS" if p else "NMOS",
+                    ctl="V_{SG}" if p else "V_{GS}", out="V_{SD}" if p else "V_{DS}",
+                    ctl_u="V_SG" if p else "V_GS", out_u="V_SD" if p else "V_DS",
+                    I="I_D", I_u="I_D", top="R_S" if p else "R_D", bot="R_D" if p else "R_S",
+                    g="G", d="D", s="S", amp_region="saturation")
+    return dict(dev="pnp" if p else "npn",
+                ctl="V_{EB}" if p else "V_{BE}", out="V_{EC}" if p else "V_{CE}",
+                ctl_u="V_EB" if p else "V_BE", out_u="V_EC" if p else "V_CE",
+                I="I_C", I_u="I_C", top="R_E" if p else "R_C", bot="R_C" if p else "R_E",
+                g="B", d="C", s="E", amp_region="active")
+
+
+# ─── Schematics (schemdraw) ───────────────────────────────────────────────────
+def _device(fam, pol, anchor_top=True):
+    if fam == "MOS":
+        e = (elm.NFet if pol == "n" else elm.PFet)().reverse().right()
+        top, bot, ctl = ("drain", "source", "gate") if pol == "n" else ("source", "drain", "gate")
+    else:
+        e = (elm.BjtNpn if pol == "n" else elm.BjtPnp)().right()
+        top, bot, ctl = ("collector", "emitter", "base") if pol == "n" else ("emitter", "collector", "base")
+    return e, top, bot, ctl
+
+
+def draw_device(fam, pol, VG, VD, I):
+    """Device on its own: source/emitter is the 0 V reference."""
+    N = names(fam, pol)
+    d = schemdraw.Drawing(show=False)
+    d.config(unit=2.0, fontsize=13)
+    e, top, bot, ctl = _device(fam, pol)
+    e = e.anchor(top)
+    d += e
+    d += elm.Line().left().at(getattr(e, ctl)).length(1.0)
+    d += elm.Dot(open=True).label(f"{N['g']}  {VG:+.2f} V", loc="left")
+    I_txt = f"$I_{N['I'][-1]}$ = {fmt_I(I)}"
+    if pol == "n":
+        ln = elm.Line().up().at(getattr(e, top)).length(1.2)
+        d += ln
+        d += elm.Dot(open=True).label(f"{N['d']}  {VD:+.2f} V", loc="right")
+        d += elm.CurrentLabelInline(direction="out").at(ln).label(I_txt, loc="bottom")
+        d += elm.Line().down().at(getattr(e, bot)).length(0.4)
+        d += elm.Ground().label(f"{N['s']} (0 V)", loc="right")
+    else:
+        d += elm.Line().up().at(getattr(e, top)).length(0.4)
+        d += elm.Vdd().label(f"{N['s']} = 0 V (reference)")
+        ln = elm.Line().down().at(getattr(e, bot)).length(1.2)
+        d += ln
+        d += elm.Dot(open=True).label(f"{N['d']}  {VD:+.2f} V", loc="right")
+        d += elm.CurrentLabelInline(direction="in").at(ln).label(I_txt, loc="bottom")
+    return d
+
+
+def _res_or_wire(d, direction, value, name, at=None, label_loc="top"):
+    if value <= 0:
+        el = getattr(elm.Line(), direction)().length(1.5)
+    else:
+        el = getattr(elm.Resistor(), direction)().label(f"${name}$\n{value:g} kΩ", loc=label_loc)
+    if at is not None:
+        el = el.at(at)
+    d += el
+    return el
+
+
+def draw_amp(fam, pol, cfg, s, r):
+    N = names(fam, pol)
+    d = schemdraw.Drawing(show=False)
+    d.config(unit=2.0, fontsize=12)
+    vdd_name = "V_{DD}" if fam == "MOS" else "V_{CC}"
+    supply_lbl = f"${vdd_name}$ = {s['VDD']:.2f} V"
+    vin_lbl = f"$v_I$ = {s['vI']:.2f} V"
+    bias_lbl = f"$V_{{BIAS}}$ = {s['VBIAS']:.2f} V"
+    n = pol == "n"
+    Rtop, Rbot = (s["Rd"], s["Rs"]) if n else (s["Rs"], s["Rd"])
+
+    # top rail: supply, or the input source for a p-type common-gate/base stage
+    if n or cfg != "CG":
+        d += elm.Vdd().label(supply_lbl)
+    else:
+        d += elm.Dot(open=True).label(vin_lbl, loc="top")
+    rt = _res_or_wire(d, "down", Rtop, N["top"].replace("_", "_{") + "}", label_loc="bottom")
+    top_node_V = r["VD"] if n else r["VS"]
+    d += elm.Dot()
+    out_top = (n and cfg != "CD") or ((not n) and cfg == "CD")
+    if out_top:
+        d.push()
+        d += elm.Line().right().length(1.4)
+        d += elm.Dot(open=True).label(f"$v_O$ = {r['vO']:.2f} V", loc="right")
+        d.pop()
+    else:
+        d.push()
+        d += elm.Line().right().length(0.01)
+        d += elm.Label().label(f"{top_node_V:.2f} V", loc="right", ofst=(0.25, 0))
+        d.pop()
+
+    e, top, bot, ctl = _device(fam, pol)
+    e = e.anchor(top)
+    d += e
+
+    # control terminal (gate/base)
+    ctl_lbl = bias_lbl if cfg == "CG" else vin_lbl
+    if fam == "MOS":
+        d += elm.Line().left().at(getattr(e, ctl)).length(1.4)
+        d += elm.Dot(open=True).label(ctl_lbl, loc="left")
+    else:
+        d.push()
+        d += elm.Dot().at(getattr(e, ctl)).label(f"{r['VG']:.2f} V", loc="bottom", ofst=(-0.35, -0.1))
+        d.pop()
+        _res_or_wire(d, "left", s["RB"], "R_{B}", at=getattr(e, ctl))
+        d += elm.Dot(open=True).label(ctl_lbl, loc="left")
+
+    # bottom node
+    d += elm.Line().down().at(getattr(e, bot)).length(0.3)
+    d += elm.Dot()
+    bot_node_V = r["VS"] if n else r["VD"]
+    if not out_top:
+        d.push()
+        d += elm.Line().right().length(1.4)
+        d += elm.Dot(open=True).label(f"$v_O$ = {r['vO']:.2f} V", loc="right")
+        d.pop()
+    else:
+        d.push()
+        d += elm.Line().right().length(0.01)
+        d += elm.Label().label(f"{bot_node_V:.2f} V", loc="right", ofst=(0.25, 0))
+        d.pop()
+    _res_or_wire(d, "down", Rbot, N["bot"].replace("_", "_{") + "}", label_loc="bottom")
+    if n and cfg == "CG":
+        d += elm.Dot(open=True).label(vin_lbl, loc="bottom")
+    else:
+        d += elm.Ground()
+    return d
+
+
+# ─── Plot helpers ─────────────────────────────────────────────────────────────
+def base_layout(fig, title, xt, yt, height=420, xr=None, yr=None):
+    fig.update_layout(template="plotly_white", title=title, height=height,
+                      margin=dict(l=60, r=20, t=50, b=60),
+                      xaxis=dict(title=xt, range=xr, zeroline=True),
+                      yaxis=dict(title=yt, range=yr, zeroline=True),
+                      legend=dict(orientation="h", y=-0.2, x=0))
+    return fig
+
+
+def add_region_colored(fig, x, y, classes, labels, width=3):
+    """Draw a curve split into segments coloured by operating region."""
+    shown = set()
+    start = 0
+    for i in range(1, len(x) + 1):
+        if i == len(x) or classes[i] != classes[start]:
+            seg = slice(start, min(i + 1, len(x)))
+            c = classes[start]
+            fig.add_trace(go.Scatter(x=x[seg], y=y[seg], mode="lines",
+                                     line=dict(color=CLASS_COLOR[c], width=width),
+                                     name=labels[c], legendgroup=c, showlegend=c not in shown,
+                                     hoverinfo="skip"))
+            shown.add(c)
+            start = i
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Page
+# ═══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(page_title="Transistor DC Lab", layout="wide")
+st.title("Transistors at DC — Interactive Lab")
+st.caption("GUPS2001 Electronics I | Dr. Yi-Chun Chin")
+
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Global Settings")
+    fam = st.radio("Transistor", ["MOS", "BJT"], horizontal=True,
+                   format_func=lambda f: "MOSFET" if f == "MOS" else "BJT")
+    pol = st.radio("Type", ["n", "p"], horizontal=True,
+                   format_func=lambda p: {("MOS", "n"): "NMOS", ("MOS", "p"): "PMOS",
+                                          ("BJT", "n"): "npn", ("BJT", "p"): "pnp"}[(fam, p)])
+    N = names(fam, pol)
+    st.divider()
+    st.markdown("**Device parameters**")
+    if fam == "MOS":
+        Vt = st.slider(("Threshold |V_tp| (V)" if pol == "p" else "Threshold V_tn (V)"),
+                       0.2, 1.5, 0.5, step=0.05)
+        k = st.slider(("k_p = k′_p(W/L)  (mA/V²)" if pol == "p" else "k_n = k′_n(W/L)  (mA/V²)"),
+                      0.2, 10.0, 2.0, step=0.1)
+        lam = st.slider("Channel-length modulation λ (V⁻¹)", 0.0, 0.2, 0.02, step=0.005)
+        P = dict(Vt=Vt, k=k, lam=lam)
+        VA_txt = "∞" if lam == 0 else f"{1 / lam:.0f} V"
+        st.markdown(f"""
+| Quantity | Value |
+|:--|--:|
+| V<sub>t</sub> | {"−" if pol == "p" else "+"}{Vt:.2f} V |
+| V<sub>A</sub> = 1/λ | {VA_txt} |
+| I<sub>D</sub> at V<sub>OV</sub> = 0.2 V | {fmt_I(0.5 * k * 0.04)} |
+""", unsafe_allow_html=True)
+    else:
+        beta = st.slider("Current gain β", 20, 400, 100, step=5)
+        VA = st.slider("Early voltage V_A (V)", 10, 300, 100, step=5)
+        IS_A = float(st.select_slider("Saturation current I_S (A)",
+                                      options=["1e-16", "1e-15", "1e-14", "1e-13"], value="1e-15"))
+        P = dict(IS=IS_A * 1e3, beta=beta, VA=float(VA))
+        st.markdown(f"""
+| Quantity | Value |
+|:--|--:|
+| V<sub>T</sub> | {VT * 1e3:.0f} mV |
+| α = β/(β+1) | {beta / (beta + 1):.4f} |
+| {"V<sub>EB</sub>" if pol == "p" else "V<sub>BE</sub>"} at I<sub>C</sub> = 1 mA | {VT * math.log(1 / P["IS"]):.3f} V |
+""", unsafe_allow_html=True)
+    st.divider()
+    st.caption("Units: V, mA, kΩ.  p-type devices use the same equations with "
+               "the voltages and the current reversed in sign.")
+
+REGION_LABELS = ({"amp": "saturation (amplifier region)", "ohmic": "triode", "off": "cutoff"}
+                 if fam == "MOS" else
+                 {"amp": "active (amplifier region)", "ohmic": "saturation", "off": "cutoff"})
+
+tab1, tab2, tab3 = st.tabs([
+    "1 · Device I–V characteristics",
+    "2 · Amplifier bias & transfer curve",
+    "3 · n-type vs p-type",
+])
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tab 1 — Device I–V
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab1:
+    st.subheader(f"{N['dev']} I–V characteristics")
+    if fam == "MOS":
+        st.latex(r"""
+        I_D=\begin{cases}0 & V_{OV}\le 0\ \text{(cutoff)}\\[2pt]
+        k\left(V_{OV}V_{DS}-\tfrac12V_{DS}^2\right) & V_{DS}<V_{OV}\ \text{(triode)}\\[2pt]
+        \tfrac12k\,V_{OV}^2\,(1+\lambda V_{DS}) & V_{DS}\ge V_{OV}\ \text{(saturation)}\end{cases}
+        \qquad V_{OV}=V_{GS}-V_t""" if pol == "n" else r"""
+        I_D=\begin{cases}0 & V_{OV}\le 0\ \text{(cutoff)}\\[2pt]
+        k\left(V_{OV}V_{SD}-\tfrac12V_{SD}^2\right) & V_{SD}<V_{OV}\ \text{(triode)}\\[2pt]
+        \tfrac12k\,V_{OV}^2\,(1+\lambda V_{SD}) & V_{SD}\ge V_{OV}\ \text{(saturation)}\end{cases}
+        \qquad V_{OV}=V_{SG}-|V_{tp}|""")
+        st.caption("Note: the app also multiplies the triode current by (1+λV_DS) so that the curves join "
+                   "smoothly at the edge of saturation. With λ = 0 it is exactly the textbook model.")
+    else:
+        st.latex(r"""I_C = I_S\,e^{V_{BE}/V_T}\left(1+\frac{V_{CE}}{V_A}\right),\qquad
+        I_B=\frac{I_C}{\beta}\qquad\text{(active: EBJ forward, CBJ reverse)}""" if pol == "n" else
+                 r"""I_C = I_S\,e^{V_{EB}/V_T}\left(1+\frac{V_{EC}}{V_A}\right),\qquad
+        I_B=\frac{I_C}{\beta}\qquad\text{(active: EBJ forward, CBJ reverse)}""")
+
+    col_ctrl, col_plot = st.columns([1, 2])
+    with col_ctrl:
+        if fam == "MOS":
+            vctl = st.slider(f"{N['ctl_u']} (V)", 0.0, 3.0, 1.5, step=0.01, key=f"t1_ctl_{fam}")
+            vout = st.slider(f"{N['out_u']} (V)", 0.0, 5.0, 2.5, step=0.01, key=f"t1_out_{fam}")
+            I = float(mos_id(vctl, vout, P))
+            region = mos_region(vctl, vout, P)
+        else:
+            vctl = st.slider(f"{N['ctl_u']} (V)", 0.50, 0.80, 0.68, step=0.002, key=f"t1_ctl_{fam}",
+                             format="%.3f")
+            vout = st.slider(f"{N['out_u']} (V)", 0.0, 5.0, 3.0, step=0.01, key=f"t1_out_{fam}")
+            I, IB = bjt_currents(vctl, vctl - vout, P)
+            region = bjt_region(vctl, vctl - vout)
+        sgn = 1 if pol == "n" else -1
+        rname = REGION_LABELS[region_class(fam, region)]
+        region_box(fam, region, f"**{rname.capitalize()}**  ·  {N['I']} = {fmt_I(I)}")
+        st.markdown(svg_html(draw_device(fam, pol, sgn * vctl, sgn * vout, I), 300),
+                    unsafe_allow_html=True)
+
+        # numbers substituted into the equation that applies
+        if fam == "MOS":
+            vov = vctl - P["Vt"]
+            o, c = N["out"], N["ctl"]
+            if region == "cutoff":
+                st.latex(rf"V_{{OV}} = {vctl:.2f}-{P['Vt']:.2f} = {vov:.2f}\ \text{{V}}\le 0"
+                         r"\ \Rightarrow\ I_D = 0")
+            elif region == "triode":
+                st.latex(rf"{o} = {vout:.2f} < V_{{OV}} = {vov:.2f}\ \Rightarrow\ \text{{triode}}")
+                st.latex(rf"\begin{{aligned}}I_D &= {P['k']:.1f}\left({vov:.2f}\cdot{vout:.2f}-\tfrac12\,{vout:.2f}^2\right)\\"
+                         rf"&\quad\times(1+{P['lam']:.3f}\cdot{vout:.2f})\\ &= {I:.3f}\ \text{{mA}}\end{{aligned}}")
+            else:
+                st.latex(rf"{o} = {vout:.2f}\ \ge V_{{OV}} = {vov:.2f}\ \Rightarrow\ \text{{sat.}}")
+                st.latex(rf"\begin{{aligned}}I_D&=\tfrac12({P['k']:.1f})({vov:.2f})^2(1+{P['lam']:.3f}\cdot{vout:.2f})\\"
+                         rf"&= {I:.3f}\ \text{{mA}}\end{{aligned}}")
+            gm = P["k"] * vov * (1 + P["lam"] * vout) if region == "saturation" else float("nan")
+            ro = 1 / (P["lam"] * I) if (P["lam"] > 0 and I > 0) else float("inf")
+            st.markdown(f"""
+| V<sub>OV</sub> | g<sub>m</sub> (sat.) | r<sub>o</sub> |
+|:-:|:-:|:-:|
+| {vov:.2f} V | {"—" if math.isnan(gm) else f"{gm:.3f} mA/V"} | {fmt_R(ro) if region == "saturation" else "—"} |
+""", unsafe_allow_html=True)
+        else:
+            vbc = vctl - vout
+            jc = "V_{CB}" if pol == "n" else "V_{BC}"
+            st.latex(rf"\text{{CBJ: }}{jc} = {-vbc:+.2f}\ \text{{V}}\ "
+                     + (r"\Rightarrow\ \text{reverse biased}" if vbc <= 0.4 else
+                        r"\Rightarrow\ \text{forward biased (saturation)}"))
+            beff = I / IB if IB > 0 else float("nan")
+            st.markdown(f"""
+| I<sub>B</sub> | I<sub>C</sub> / I<sub>B</sub> | g<sub>m</sub> = I<sub>C</sub>/V<sub>T</sub> |
+|:-:|:-:|:-:|
+| {fmt_I(IB)} | {f"{beff:.1f}" if math.isfinite(beff) and I > 1e-9 else "—"} | {f"{I / VT:.2f} mA/V" if region == "active" else "—"} |
+""", unsafe_allow_html=True)
+            if region == "saturation":
+                st.caption(f"In saturation I_C/I_B ({beff:.1f}) falls below β = {P['beta']}: "
+                           "the collector can no longer take all the current the base could supply.")
+
+    with col_plot:
+        signed = st.checkbox("Signed axes for p-type (show the third-quadrant picture)",
+                             value=False, disabled=(pol == "n"), key="t1_signed")
+        s = -1 if (pol == "p" and signed) else 1
+        if fam == "MOS":
+            vx = np.linspace(0, 5, 401)
+            fam_vals = [v for v in [1.0, 1.5, 2.0, 2.5, 3.0] if v > P["Vt"]]
+            fig = go.Figure()
+            for v in fam_vals:
+                fig.add_trace(go.Scatter(x=s * vx, y=s * mos_id(v, vx, P), mode="lines",
+                                         line=dict(color="lightgray", width=1.5),
+                                         name=f"{N['ctl_u']} = {v:.1f} V", showlegend=False,
+                                         hovertemplate=f"{N['ctl_u']} = {v:.1f} V<extra></extra>"))
+                fig.add_annotation(x=s * 5, y=s * float(mos_id(v, 5, P)), text=f"{v:.1f} V",
+                                   showarrow=False, xanchor="left" if s > 0 else "right",
+                                   font=dict(color="gray", size=10))
+            # edge of saturation locus  V_DS = V_OV
+            vov_l = np.linspace(0, 3.0 - P["Vt"], 200)
+            fig.add_trace(go.Scatter(x=s * vov_l, y=s * 0.5 * P["k"] * vov_l ** 2 * (1 + P["lam"] * vov_l),
+                                     mode="lines", line=dict(color="black", dash="dash", width=1),
+                                     name=f"edge of saturation ({N['out_u']} = V_OV)"))
+            ycur = mos_id(vctl, vx, P)
+            fig.add_trace(go.Scatter(x=s * vx, y=s * ycur, mode="lines",
+                                     line=dict(color="royalblue", width=3),
+                                     name=f"{N['ctl_u']} = {vctl:.2f} V"))
+            ymax = max(float(mos_id(3.0, 5, P)), float(ycur.max())) * 1.1 + 1e-6
+        else:
+            vx = np.linspace(0, 5, 401)
+            fam_vals = [0.64, 0.66, 0.68, 0.70, 0.72]
+            fig = go.Figure()
+
+            def ic_curve(vbe):
+                # clip the small reverse current near V_CE = 0 so the plot stays readable
+                return np.maximum([bjt_currents(vbe, vbe - v, P)[0] for v in vx], 0.0)
+
+            for v in fam_vals:
+                yy = ic_curve(v)
+                fig.add_trace(go.Scatter(x=s * vx, y=s * yy, mode="lines",
+                                         line=dict(color="lightgray", width=1.5), showlegend=False,
+                                         hovertemplate=f"{N['ctl_u']} = {v:.2f} V<extra></extra>"))
+                fig.add_annotation(x=s * 5, y=s * yy[-1], text=f"{v:.2f} V", showarrow=False,
+                                   xanchor="left" if s > 0 else "right", font=dict(color="gray", size=10))
+            vb_l = np.linspace(0.6, 0.8, 100)
+            edge = np.array([bjt_currents(v, 0.4, P)[0] for v in vb_l])
+            fig.add_trace(go.Scatter(x=s * (vb_l - 0.4), y=s * edge, mode="lines",
+                                     line=dict(color="black", dash="dash", width=1),
+                                     name="edge of saturation (CBJ forward by 0.4 V)"))
+            ycur = ic_curve(vctl)
+            fig.add_trace(go.Scatter(x=s * vx, y=s * ycur, mode="lines",
+                                     line=dict(color="royalblue", width=3),
+                                     name=f"{N['ctl_u']} = {vctl:.3f} V"))
+            ymax = max(float(ic_curve(0.72)[-1]), float(ycur.max())) * 1.1 + 1e-6
+        cls = region_class(fam, region)
+        fig.add_trace(go.Scatter(x=[s * vout], y=[s * I], mode="markers",
+                                 marker=dict(size=13, color=CLASS_COLOR[cls], line=dict(color="black", width=1)),
+                                 name=f"operating point ({rname})"))
+        xr = [0, 5.4] if s > 0 else [-5.4, 0]
+        yr = [0, ymax] if s > 0 else [-ymax, 0]
+        xt = f"{hsub(N['out_u'])} (V)" if s > 0 else ("V<sub>DS</sub> (V)" if fam == "MOS" else "V<sub>CE</sub> (V)")
+        yt = f"{hsub(N['I_u'])} (mA)" if s > 0 else (
+            "I<sub>D</sub>, into drain (mA)" if fam == "MOS" else "I<sub>C</sub>, into collector (mA)")
+        st.plotly_chart(base_layout(fig, "Output characteristics", xt, yt, 430, xr, yr),
+                        use_container_width=True)
+
+        # transfer characteristic
+        fig2 = go.Figure()
+        if fam == "MOS":
+            vg = np.linspace(0, 3, 301)
+            yy = mos_id(vg, vout, P)
+            fig2.add_trace(go.Scatter(x=s * vg, y=s * yy, mode="lines", line=dict(color="royalblue", width=3),
+                                      name=f"{N['out_u']} = {vout:.2f} V"))
+            fig2.add_vline(x=s * P["Vt"], line_dash="dot", line_color="gray",
+                           annotation_text="|V_t|" if pol == "p" else "V_t")
+            ylog = False
+            ttl = "Transfer characteristic"
+        else:
+            ylog = st.checkbox("Log current axis (60 mV per decade)", value=False, key="t1_log")
+            vg = np.linspace(0.40, 0.80, 401)
+            yy = np.array([bjt_currents(v, v - vout, P)[0] for v in vg])
+            yb = np.array([bjt_currents(v, v - vout, P)[1] for v in vg])
+            fig2.add_trace(go.Scatter(x=s * vg, y=s * yy if not ylog else yy, mode="lines",
+                                      line=dict(color="royalblue", width=3), name=f"{N['I_u']}"))
+            fig2.add_trace(go.Scatter(x=s * vg, y=s * yb if not ylog else yb, mode="lines",
+                                      line=dict(color="mediumpurple", width=2, dash="dash"), name="I_B"))
+            ttl = f"Transfer characteristic at {N['out_u']} = {vout:.2f} V"
+        fig2.add_trace(go.Scatter(x=[s * vctl], y=[(s * I) if not ylog else max(I, 1e-12)], mode="markers",
+                                  marker=dict(size=13, color=CLASS_COLOR[cls], line=dict(color="black", width=1)),
+                                  name="operating point"))
+        xt2 = f"{hsub(N['ctl_u'])} (V)" if s > 0 else ("V<sub>GS</sub> (V)" if fam == "MOS" else "V<sub>BE</sub> (V)")
+        base_layout(fig2, ttl if fam == "BJT" else f"{ttl} at {N['out_u']} = {vout:.2f} V", xt2, yt, 380)
+        if ylog:
+            fig2.update_yaxes(type="log", range=[-6, 2], title=f"{hsub(N['I_u'])} (mA, log)")
+        elif fam == "BJT":
+            fig2.update_yaxes(range=[min(0, s * ymax), max(0, s * ymax)])
+        st.plotly_chart(fig2, use_container_width=True)
+
+    with st.expander("What to try", expanded=False):
+        if fam == "MOS":
+            st.markdown(f"""
+- Hold {N['ctl_u']} fixed and raise {N['out_u']} from 0: the point leaves the triode region exactly where it crosses the dashed curve, {N['out_u']} = V_OV.
+- In saturation, I_D barely depends on {N['out_u']} (set λ = 0 to make it flat). That flatness is what makes the MOSFET a good current source.
+- Below |V_t| nothing flows, whatever {N['out_u']} is.
+- Switch between NMOS and PMOS: the curves are identical in magnitude. Tick *signed axes* to see that every voltage and the current change sign.""")
+        else:
+            st.markdown(f"""
+- Raise {N['ctl_u']} by 18 mV: I_C doubles (V_T ln 2 = 17.3 mV). Turn on the log axis to see a straight line of about 60 mV per decade.
+- Lower {N['out_u']} below about 0.3 V: the collector–base junction becomes forward biased, the BJT saturates and I_C/I_B drops below β.
+- Careful with names: **BJT saturation is not MOSFET saturation**. For a BJT the amplifier region is *active*.
+- Switch between npn and pnp: same magnitudes, opposite signs.""")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tab 2 — Amplifier bias and transfer curve
+# ═══════════════════════════════════════════════════════════════════════════════
+DEFAULTS = {
+    ("MOS", "CS"): dict(VDD=3.0, Rd=5.0, Rs=0.0, RB=0.0, vI=1.0, VBIAS=1.5),
+    ("MOS", "CD"): dict(VDD=3.0, Rd=0.0, Rs=2.0, RB=0.0, vI=2.0, VBIAS=1.5),
+    ("MOS", "CG"): dict(VDD=3.0, Rd=5.0, Rs=1.0, RB=0.0, vI=0.3, VBIAS=1.5),
+    ("BJT", "CS"): dict(VDD=5.0, Rd=2.0, Rs=0.0, RB=100.0, vI=1.5, VBIAS=1.5),
+    ("BJT", "CD"): dict(VDD=5.0, Rd=0.0, Rs=2.0, RB=10.0, vI=3.0, VBIAS=1.5),
+    ("BJT", "CG"): dict(VDD=5.0, Rd=2.0, Rs=1.0, RB=10.0, vI=0.3, VBIAS=1.5),
+}
+CFG_NAMES = {"MOS": {"CS": "Common source (CS)", "CD": "Common drain / source follower (CD)",
+                     "CG": "Common gate (CG)"},
+             "BJT": {"CS": "Common emitter (CE)", "CD": "Common collector / emitter follower (CC)",
+                     "CG": "Common base (CB)"}}
+
+with tab2:
+    st.subheader("Amplifier configurations — DC bias and voltage transfer curve")
+    cfg = st.radio("Configuration", ["CS", "CD", "CG"], horizontal=True,
+                   format_func=lambda c: CFG_NAMES[fam][c], key=f"cfg_{fam}")
+    key = f"{fam}_{pol}_{cfg}"
+    dflt = dict(DEFAULTS[(fam, cfg)])
+    if pol == "p":   # mirror image of the n-type defaults
+        dflt["vI"] = dflt["VDD"] - dflt["vI"]
+        dflt["VBIAS"] = dflt["VDD"] - dflt["VBIAS"]
+    for nm, v in dflt.items():
+        st.session_state.setdefault(f"{key}_{nm}", v)
+
+    col_ctrl, col_plot = st.columns([1, 2])
+    with col_ctrl:
+        vdd_u = "V_DD" if fam == "MOS" else "V_CC"
+        VDD = st.slider(f"Supply {vdd_u} (V)", 1.0, 12.0, step=0.1, key=f"{key}_VDD")
+        for nm in ("vI", "VBIAS"):
+            if st.session_state[f"{key}_{nm}"] > VDD:
+                st.session_state[f"{key}_{nm}"] = VDD
+        in_where = {"CS": N["g"], "CD": N["g"], "CG": N["s"]}[cfg]
+        vI = st.slider(f"Input v_I (V), applied at the {'gate' if in_where == 'G' else 'base' if in_where == 'B' else 'source' if in_where == 'S' else 'emitter'}",
+                       0.0, VDD, step=0.01, key=f"{key}_vI")
+        VBIAS = (st.slider(f"Bias V_BIAS on the {'gate' if fam == 'MOS' else 'base'} (V)", 0.0, VDD,
+                           step=0.05, key=f"{key}_VBIAS") if cfg == "CG" else st.session_state[f"{key}_VBIAS"])
+        dn, sn = ("R_D", "R_S") if fam == "MOS" else ("R_C", "R_E")
+        Rd = st.slider(f"{dn} (kΩ)", 0.0, 20.0, step=0.1, key=f"{key}_Rd")
+        Rs = st.slider(f"{sn} (kΩ)", 0.0, 10.0, step=0.1, key=f"{key}_Rs")
+        RB = (st.slider("R_B (kΩ)", 0.0, 300.0, step=1.0, key=f"{key}_RB")
+              if fam == "BJT" else 0.0)
+        if st.button("Reset this circuit", key=f"{key}_reset"):
+            for nm, v in dflt.items():
+                st.session_state[f"{key}_{nm}"] = v
+            st.rerun()
+
+    s_amp = dict(VDD=VDD, Rd=Rd, Rs=Rs, RB=RB, vI=vI, VBIAS=VBIAS)
+    r = solve_amp(fam, pol, cfg, s_amp, P)
+    cls = region_class(fam, r["region"])
+
+    # voltage transfer curve (sweep v_I, warm-started for the BJT)
+    vis = np.linspace(0, VDD, 241)
+    vo, cl = [], []
+    warm = None
+    for v in vis:
+        rr = solve_amp(fam, pol, cfg, dict(s_amp, vI=float(v)), P, warm)
+        warm = rr.get("x")
+        vo.append(rr["vO"])
+        cl.append(region_class(fam, rr["region"]))
+    vo = np.array(vo)
+
+    # small-signal gain at Q: slope of the transfer curve, and the textbook formula
+    dv = 1e-3
+    rp = solve_amp(fam, pol, cfg, dict(s_amp, vI=vI + dv), P, r.get("x"))
+    rm = solve_amp(fam, pol, cfg, dict(s_amp, vI=vI - dv), P, r.get("x"))
+    slope = (rp["vO"] - rm["vO"]) / (2 * dv)
+    Iq = abs(r["I"])
+    if fam == "MOS":
+        vov = r["VGS"] - P["Vt"]
+        gm = P["k"] * vov * (1 + P["lam"] * r["VDS"]) if r["region"] == "saturation" else float("nan")
+        ro = 1 / (P["lam"] * Iq) if (P["lam"] > 0 and Iq > 0) else float("inf")
+        if cfg == "CS":
+            A_f, A_tex = -gm * Rd / (1 + gm * Rs), r"A_v=-\dfrac{g_mR_D}{1+g_mR_S}"
+        elif cfg == "CD":
+            A_f, A_tex = gm * Rs / (1 + gm * Rs), r"A_v=\dfrac{g_mR_S}{1+g_mR_S}"
+        else:
+            A_f, A_tex = gm * Rd / (1 + gm * Rs), r"A_v=\dfrac{g_mR_D}{1+g_mR_S}"
+    else:
+        gm = Iq / VT if r["region"] == "active" else float("nan")
+        rpi = P["beta"] / gm if gm > 0 else float("nan")
+        ro = P["VA"] / Iq if Iq > 0 else float("inf")
+        den = RB + rpi + (P["beta"] + 1) * Rs
+        if cfg == "CS":
+            A_f, A_tex = -P["beta"] * Rd / den, r"A_v=-\dfrac{\beta R_C}{R_B+r_\pi+(\beta+1)R_E}"
+        elif cfg == "CD":
+            A_f, A_tex = (P["beta"] + 1) * Rs / den, r"A_v=\dfrac{(\beta+1)R_E}{R_B+r_\pi+(\beta+1)R_E}"
+        else:
+            A_f, A_tex = P["beta"] * Rd / den, r"A_v=\dfrac{\beta R_C}{R_B+r_\pi+(\beta+1)R_E}"
+
+    with col_ctrl:
+        rname = REGION_LABELS[cls]
+        region_box(fam, r["region"], f"**{rname.capitalize()}**  ·  {N['I']} = {fmt_I(Iq)}  ·  v_O = {r['vO']:.2f} V")
+        st.markdown(svg_html(draw_amp(fam, pol, cfg, s_amp, r), 340), unsafe_allow_html=True)
+
+    with col_plot:
+        figv = go.Figure()
+        add_region_colored(figv, vis, vo, cl, REGION_LABELS)
+        if cfg == "CD":
+            figv.add_trace(go.Scatter(x=[0, VDD], y=[0, VDD], mode="lines", name="v_O = v_I",
+                                      line=dict(color="gray", dash="dot", width=1)))
+        figv.add_vline(x=vI, line_dash="dot", line_color="gray")
+        figv.add_trace(go.Scatter(x=[vI], y=[r["vO"]], mode="markers",
+                                  marker=dict(size=14, color=CLASS_COLOR[cls], line=dict(color="black", width=1)),
+                                  name=f"Q: v_I = {vI:.2f} V, v_O = {r['vO']:.2f} V"))
+        base_layout(figv, f"Voltage transfer characteristic — {CFG_NAMES[fam][cfg]}",
+                    "Input v_I (V)", "Output v_O (V)", 420, [0, VDD], [-0.02 * VDD, VDD * 1.03])
+        st.plotly_chart(figv, use_container_width=True)
+
+        # load line on the output characteristics
+        figl = go.Figure()
+        Vint = r["Vint"]
+        vx = np.linspace(0, max(Vint, 0.1), 300)
+        vctl_q = r["VGS"]
+        if fam == "MOS":
+            dev_curve = mos_id(vctl_q, vx, P)
+            Rload = Rd + Rs
+        else:
+            dev_curve = np.maximum([bjt_currents(vctl_q, vctl_q - v, P)[0] for v in vx], 0.0)
+            alpha = r["I"] / r["IE"] if r["IE"] > 0 else P["beta"] / (P["beta"] + 1)
+            Rload = Rd + Rs / alpha
+        figl.add_trace(go.Scatter(x=vx, y=dev_curve, mode="lines", line=dict(color="royalblue", width=3),
+                                  name=f"device: {N['ctl_u']} = {vctl_q:.3f} V"))
+        if Rload > 0:
+            figl.add_trace(go.Scatter(x=[0, Vint], y=[Vint / Rload, 0], mode="lines",
+                                      line=dict(color="black", width=2, dash="dash"),
+                                      name=f"load line: slope −1/{Rload:.2f} kΩ"))
+        ytop = max(float(np.max(dev_curve)), Iq) * 1.3 + 1e-3
+        if Rload > 0 and Vint / Rload < 4 * ytop:
+            ytop = max(ytop, Vint / Rload * 1.1)
+        figl.add_trace(go.Scatter(x=[r["VDS"]], y=[Iq], mode="markers",
+                                  marker=dict(size=14, color=CLASS_COLOR[cls], line=dict(color="black", width=1)),
+                                  name="Q point"))
+        base_layout(figl, "Load line on the output characteristic",
+                    f"{hsub(N['out_u'])} (V)", f"{hsub(N['I_u'])} (mA)", 380,
+                    [0, max(Vint, 0.1) * 1.05], [0, ytop])
+        st.plotly_chart(figl, use_container_width=True)
+
+    # numbers
+    st.markdown("#### Bias point")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(N["I_u"], fmt_I(Iq))
+    c2.metric(f"{N['g']} / {N['s']} / {N['d']}  (V)", f"{r['VG']:.2f} / {r['VS']:.2f} / {r['VD']:.2f}")
+    c3.metric(N["ctl_u"], f"{r['VGS']:.3f} V")
+    c4.metric(N["out_u"], f"{r['VDS']:.3f} V")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**How the bias point is found**")
+        n = pol == "n"
+        Xs = ("0" if n else (r"V_{DD}" if fam == "MOS" else r"V_{CC}")) if cfg != "CG" else "v_I"
+        if fam == "MOS":
+            if n:
+                st.latex(rf"V_{{GS}} = V_G - I_D R_S - {Xs} = {r['VGS']:.3f}\ \text{{V}}")
+                st.latex(rf"V_{{DS}} = V_{{DD}} - I_D(R_D+R_S) - {Xs} = {r['VDS']:.3f}\ \text{{V}}")
+            else:
+                st.latex(rf"V_{{SG}} = {Xs} - I_D R_S - V_G = {r['VGS']:.3f}\ \text{{V}}")
+                st.latex(rf"V_{{SD}} = {Xs} - I_D(R_S+R_D) = {r['VDS']:.3f}\ \text{{V}}")
+            st.caption("Both equations hold together with the I_D equation of the present region; "
+                       "the app solves them numerically. Check the region against "
+                       f"{N['out_u']} ≥ V_OV for saturation.")
+        else:
+            if n:
+                st.latex(rf"V_{{B,in}} - {Xs} = I_B R_B + V_{{BE}} + I_E R_E")
+            else:
+                st.latex(rf"{Xs} - V_{{B,in}} = I_E R_E + V_{{EB}} + I_B R_B")
+            Vbin = VBIAS if cfg == "CG" else vI
+            Xv = (0 if n else VDD) if cfg != "CG" else vI
+            drive = (Vbin - Xv) if n else (Xv - Vbin)
+            IB7 = (drive - 0.7) / (RB + (P["beta"] + 1) * Rs) if (RB + (P["beta"] + 1) * Rs) > 0 else float("nan")
+            if IB7 > 0:
+                IC7 = P["beta"] * IB7
+                st.markdown("Course estimate with the 0.7 V model:")
+                st.latex(rf"I_B=\frac{{{drive:.2f}-0.7}}{{R_B+(\beta+1)R_E}}={IB7 * 1e3:.2f}\ \mu\text{{A}},"
+                         rf"\quad I_C=\beta I_B={IC7:.3f}\ \text{{mA}}")
+                st.caption(f"Exponential model gives I_C = {Iq:.3f} mA with "
+                           f"{N['ctl_u']} = {r['VGS']:.3f} V. The 0.7 V estimate is valid only "
+                           "if the transistor is really in the active region.")
+            else:
+                st.caption("Course estimate (0.7 V): the base–emitter junction does not turn on, so I_C ≈ 0.")
+    with right:
+        st.markdown("**Small-signal view at this bias point**")
+        if cls == "amp":
+            if fam == "MOS":
+                st.markdown(f"g<sub>m</sub> = {gm:.3f} mA/V &nbsp;·&nbsp; r<sub>o</sub> = {fmt_R(ro)}",
+                            unsafe_allow_html=True)
+            else:
+                st.markdown(f"g<sub>m</sub> = {gm:.2f} mA/V &nbsp;·&nbsp; r<sub>π</sub> = {fmt_R(rpi)}"
+                            f" &nbsp;·&nbsp; r<sub>o</sub> = {fmt_R(ro)}", unsafe_allow_html=True)
+            st.latex(A_tex + rf"= {A_f:.2f}\ \text{{V/V}}\quad(r_o\ \text{{neglected}})")
+            st.markdown(f"Slope of the transfer curve at Q: **{slope:.2f} V/V** "
+                        "(exact, includes r<sub>o</sub> and the full nonlinear model).",
+                        unsafe_allow_html=True)
+        else:
+            st.warning(f"The transistor is in **{REGION_LABELS[cls]}**, so this circuit is not "
+                       f"amplifying here (slope of the transfer curve = {slope:.2f} V/V). "
+                       f"Move v_I until the Q point sits on the green part of the curve.")
+
+    with st.expander("What to try", expanded=False):
+        if cfg == "CS":
+            st.markdown(f"""
+- Sweep v_I from 0 to the supply. The {('CS' if fam == 'MOS' else 'CE')} stage goes cutoff → {REGION_LABELS['amp'].split(' ')[0]} → {REGION_LABELS['ohmic']}. The output swings opposite to the input: the gain is negative.
+- The gain is the slope of the curve. It is largest in the green part, and the bias point is normally placed in the middle of it to leave room for the signal to swing both ways.
+- Add {sn}: the curve becomes less steep but straighter (more linear). Compare the formula with the slope.
+- Switch to p-type: the curve looks the same, but the device sits at the top of the circuit and the transistor turns **on** when v_I goes **down**.""")
+        elif cfg == "CD":
+            st.markdown(f"""
+- The output follows the input, about one {'V_GS' if fam == 'MOS' else '0.7 V'} lower (n-type) or higher (p-type). Compare with the dotted v_O = v_I line.
+- The gain is just below 1. Increase {sn}: the gain approaches 1.
+- The follower does not amplify voltage; its job is a low output resistance (a buffer).""")
+        else:
+            st.markdown(f"""
+- The input enters at the {'source' if fam == 'MOS' else 'emitter'}. Raising v_I (n-type) reduces {N['ctl_u']}, so the current falls and v_O **rises**: the gain is positive.
+- Change V_BIAS to move the whole curve left or right.
+- Make {sn} small: the gain grows, because the input current is no longer limited by {sn}.""")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tab 3 — n-type vs p-type
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab3:
+    st.subheader(f"{'NMOS vs PMOS' if fam == 'MOS' else 'npn vs pnp'} — the same device with every sign reversed")
+    col_ctrl, col_plot = st.columns([1, 2])
+    with col_ctrl:
+        if fam == "MOS":
+            mag_c = st.slider("Gate drive |V_GS| (V)", 0.0, 3.0, 1.5, step=0.01, key="t3_c")
+        else:
+            mag_c = st.slider("Base drive |V_BE| (V)", 0.50, 0.80, 0.68, step=0.002, key="t3_c", format="%.3f")
+        mag_o = st.slider("|V_DS|" if fam == "MOS" else "|V_CE|", 0.0, 5.0, 2.5, step=0.01, key="t3_o")
+        if fam == "MOS":
+            Im = float(mos_id(mag_c, mag_o, P))
+            rg = mos_region(mag_c, mag_o, P)
+        else:
+            Im = bjt_currents(mag_c, mag_c - mag_o, P)[0]
+            rg = bjt_region(mag_c, mag_c - mag_o)
+        region_box(fam, rg, f"Both devices: **{REGION_LABELS[region_class(fam, rg)]}**")
+        if fam == "MOS":
+            st.markdown(f"""
+| | NMOS | PMOS |
+|:--|--:|--:|
+| V<sub>GS</sub> | {mag_c:+.2f} V | {-mag_c:+.2f} V |
+| V<sub>DS</sub> | {mag_o:+.2f} V | {-mag_o:+.2f} V |
+| V<sub>t</sub> | +{P['Vt']:.2f} V | −{P['Vt']:.2f} V |
+| I<sub>D</sub> into drain | {fmt_I(Im)} | −{fmt_I(Im)} |
+| Turns on when | V<sub>GS</sub> > V<sub>tn</sub> | V<sub>GS</sub> < V<sub>tp</sub> (V<sub>SG</sub> > \\|V<sub>tp</sub>\\|) |
+| Carriers | electrons | holes |
+""", unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+| | npn | pnp |
+|:--|--:|--:|
+| V<sub>BE</sub> | {mag_c:+.3f} V | {-mag_c:+.3f} V |
+| V<sub>CE</sub> | {mag_o:+.2f} V | {-mag_o:+.2f} V |
+| I<sub>C</sub> into collector | {fmt_I(Im)} | −{fmt_I(Im)} |
+| Emitter arrow | points out | points in |
+| Carriers through base | electrons | holes |
+""", unsafe_allow_html=True)
+        st.caption("Same parameters for both devices, so the curves are point-symmetric about the origin. "
+                   "In a real process the p-type device is weaker (lower hole mobility) unless it is made wider.")
+    with col_plot:
+        figc = go.Figure()
+        vx = np.linspace(0, 5, 301)
+        if fam == "MOS":
+            yy = mos_id(mag_c, vx, P)
+        else:
+            yy = np.maximum([bjt_currents(mag_c, mag_c - v, P)[0] for v in vx], 0.0)
+        figc.add_trace(go.Scatter(x=vx, y=yy, mode="lines", line=dict(color="royalblue", width=3),
+                                  name="NMOS" if fam == "MOS" else "npn"))
+        figc.add_trace(go.Scatter(x=-vx, y=-yy, mode="lines", line=dict(color="crimson", width=3),
+                                  name="PMOS" if fam == "MOS" else "pnp"))
+        figc.add_trace(go.Scatter(x=[mag_o, -mag_o], y=[Im, -Im], mode="markers",
+                                  marker=dict(size=12, color=["royalblue", "crimson"], line=dict(color="black", width=1)),
+                                  name="operating points"))
+        ym = max(float(yy.max()), 1e-3) * 1.15
+        base_layout(figc, "Signed output characteristics",
+                    "V<sub>DS</sub> (V)" if fam == "MOS" else "V<sub>CE</sub> (V)",
+                    "I<sub>D</sub> into drain (mA)" if fam == "MOS" else "I<sub>C</sub> into collector (mA)",
+                    520, [-5.3, 5.3], [-ym, ym])
+        figc.add_annotation(x=2.6, y=ym * 0.35, text="1st quadrant: n-type", showarrow=False,
+                            font=dict(color="royalblue"))
+        figc.add_annotation(x=-2.6, y=-ym * 0.35, text="3rd quadrant: p-type", showarrow=False,
+                            font=dict(color="crimson"))
+        st.plotly_chart(figc, use_container_width=True)
