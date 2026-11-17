@@ -3,7 +3,7 @@ name = "microelectronics-transistor-lab"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-    "streamlit>=1.32",
+    "streamlit>=1.50",
     "numpy>=1.26",
     "plotly>=5.18",
     "matplotlib>=3.8",
