@@ -185,6 +185,8 @@ def cur_label(sym, i_mA):
 def fmt_R(r_k):
     if not math.isfinite(r_k):
         return "∞"
+    if r_k < 1:
+        return f"{r_k * 1e3:.3g} Ω"
     return f"{r_k:.2f} kΩ" if r_k < 1000 else f"{r_k / 1000:.2f} MΩ"
 
 
@@ -382,6 +384,98 @@ def draw_amp(fam, pol, cfg, s, r):
     else:
         d += elm.Ground()
     return d
+
+
+def draw_small_signal(fam, cfg, model, v):
+    """Small-signal equivalent circuit of the amplifier (DC supplies -> ac ground).
+    model: 'pi' (hybrid-π) or 'T'.  v: dict of element values (kΩ, mA/V).
+    The same picture holds for n-type and p-type devices."""
+    mos = fam == "MOS"
+    g, dn, sn = ("G", "D", "S") if mos else ("B", "C", "E")
+    vc = "v_{gs}" if mos else "v_{\\pi}"
+    d = schemdraw.Drawing(show=False)
+    d.config(unit=2.0, fontsize=11)
+    D, S = (4, 4), (4, 0)
+    # ── transistor model between D, S and the control node G ──
+    if model == "pi":
+        G = (1.5, 4)
+        d += elm.SourceControlledI().endpoints(D, S).label(f"$g_m {vc}$", loc="bottom", ofst=0.1)
+        if mos:
+            d += elm.Gap().endpoints(G, (1.5, 0)).label(["+", f"${vc}$", "−"], loc="bottom")
+        else:
+            d += (elm.Resistor().endpoints(G, (1.5, 0))
+                  .label(f"$r_\\pi$\n{fmt_R(v['rpi'])}", loc="top")
+                  .label(["+", f"${vc}$", "−"], loc="bottom"))
+        d += elm.Line().endpoints((1.5, 0), S)
+    else:
+        X = (4, 2)
+        G = (1.5, 2)
+        d += elm.SourceControlledI().endpoints(D, X).label(
+            "$g_m v_{gs}$" if mos else "$\\alpha i_e$", loc="bottom", ofst=0.1)
+        d += elm.Resistor().endpoints(X, S).label(
+            f"$1/g_m$\n{fmt_R(1 / v['gm'])}" if mos else f"$r_e$\n{fmt_R(v['re'])}", loc="bottom")
+        d += elm.Line().endpoints(X, G)
+        d += elm.Dot().at(X)
+    if math.isfinite(v["ro"]):
+        d += elm.Line().endpoints(D, (6, 4))
+        d += elm.Line().endpoints(S, (6, 0))
+        d += elm.Resistor().endpoints((6, 4), (6, 0)).label(f"$r_o$\n{fmt_R(v['ro'])}", loc="bottom")
+    d += elm.Dot().at(D).label(dn, loc="top")
+    d += elm.Dot().at(S).label(sn, loc="bottom", ofst=(-0.35, -0.05))
+    d += elm.Dot().at(G).label(g, loc="top")
+
+    # ── drain/collector side: R_D to ac ground, output ──
+    d += elm.Line().endpoints(D, (8, 4))
+    if v["Rd"] > 0:
+        d += elm.Resistor().endpoints((8, 4), (8, 1.9)).label(
+            f"$R_{'D' if mos else 'C'}$\n{v['Rd']:g} kΩ", loc="bottom")
+        d += elm.Ground().at((8, 1.9))
+    else:
+        d += elm.Line().endpoints((8, 4), (8, 3.2))
+        d += elm.Ground().at((8, 3.2))
+    if cfg != "CD":
+        d += elm.Dot().at((8, 4))
+        d += elm.Line().endpoints((8, 4), (9.6, 4))
+        d += elm.Dot(open=True).at((9.6, 4)).label("$v_o$", loc="right")
+    else:
+        d += elm.Line().endpoints(S, (9.6, 0))
+        d += elm.Dot(open=True).at((9.6, 0)).label("$v_o$", loc="right")
+
+    # ── source/emitter side: R_S to ac ground, or to the input for CG/CB ──
+    bot = (4, -2.0)
+    if v["Rs"] > 0:
+        d += elm.Resistor().endpoints(S, bot).label(f"$R_{'S' if mos else 'E'}$\n{v['Rs']:g} kΩ", loc="bottom")
+    else:
+        d += elm.Line().endpoints(S, bot)
+    if cfg == "CG":
+        d += elm.SourceSin().endpoints((4, -4.0), bot).label("$v_i$", loc="bottom")
+        d += elm.Ground().at((4, -4.0))
+    else:
+        d += elm.Ground().at(bot)
+
+    # ── control side: input source (CS/CD) or ac ground (CG) ──
+    xin = (-1.6, G[1])
+    if cfg == "CG":
+        if not mos and v["RB"] > 0:
+            d += elm.Resistor().endpoints(G, xin).label(f"$R_B$\n{v['RB']:g} kΩ", loc="top")
+        else:
+            d += elm.Line().endpoints(G, xin)
+        d += elm.Line().endpoints(xin, (-1.6, G[1] - 0.8))
+        d += elm.Ground().at((-1.6, G[1] - 0.8))
+    else:
+        if not mos and v["RB"] > 0:
+            d += elm.Resistor().endpoints(xin, G).label(f"$R_B$\n{v['RB']:g} kΩ", loc="top")
+        else:
+            d += elm.Line().endpoints(xin, G)
+        d += elm.SourceSin().endpoints((-1.6, G[1] - 2.0), xin).label("$v_i$", loc="bottom")
+        d += elm.Ground().at((-1.6, G[1] - 2.0))
+    return d
+
+
+@st.cache_data(max_entries=300, show_spinner=False)
+def small_signal_svg(fam, cfg, model, vk):
+    v = dict(zip(("gm", "rpi", "re", "ro", "Rd", "Rs", "RB"), vk))
+    return svg_html(draw_small_signal(fam, cfg, model, v), 460)
 
 
 # ─── Plot helpers ─────────────────────────────────────────────────────────────
@@ -875,6 +969,69 @@ def render_tab2():
             st.warning(f"The transistor is in **{REGION_LABELS[cls]}**, so this circuit is not "
                        f"amplifying here (slope of the transfer curve = {slope:.2f} V/V). "
                        f"Move v_I until the Q point sits on the green part of the curve.")
+
+    # ── small-signal equivalent circuit: hidden until the student asks for it ──
+    st.markdown("#### Small-signal equivalent circuit")
+    st.caption("Draw the small-signal model of this circuit yourself first, then click a model to check it. "
+               "Click the selected model again to hide it.")
+    model = st.segmented_control("Equivalent model", ["pi", "T"], selection_mode="single", default=None,
+                                 format_func=lambda m: "Hybrid-π model" if m == "pi" else "T model",
+                                 key="ss_model", label_visibility="collapsed")
+    if model is not None:
+        if cls != "amp":
+            st.warning(f"No small-signal model here: the transistor is in {REGION_LABELS[cls]}. "
+                       f"The model is valid only in {REGION_LABELS['amp'].split(' ')[0]}.")
+        else:
+            mos = fam == "MOS"
+            beta = P.get("beta", float("nan"))
+            alpha = beta / (beta + 1) if not mos else 1.0
+            re_ = alpha / gm
+            rpi_v = rpi if not mos else float("nan")
+            vk = (round(gm, 4), round(rpi_v, 3) if not mos else 0.0, round(re_, 4), round(ro, 2) if math.isfinite(ro) else ro,
+                  round(Rd, 2), round(Rs, 2), round(RB, 1))
+            c_draw, c_num = st.columns([3, 2])
+            with c_draw:
+                st.markdown(small_signal_svg(fam, cfg, model, vk), unsafe_allow_html=True)
+                st.caption("DC supplies and DC bias sources become ac ground. "
+                           + ("The same model is used for PMOS. " if mos else "The same model is used for pnp. ")
+                           + ("" if math.isfinite(ro) else "r_o = ∞ here (λ = 0), so it is not drawn."
+                              if mos else "r_o = ∞ here (Early effect off), so it is not drawn."))
+            with c_num:
+                st.markdown("**Model parameters at this bias point**")
+                if mos:
+                    rows = [("g<sub>m</sub>", f"{gm:.3f} mA/V"), ("1/g<sub>m</sub>", fmt_R(1 / gm)),
+                            ("r<sub>o</sub>", fmt_R(ro))]
+                else:
+                    rows = [("g<sub>m</sub> = I<sub>C</sub>/V<sub>T</sub>", f"{gm:.2f} mA/V"),
+                            ("r<sub>π</sub> = β/g<sub>m</sub>", fmt_R(rpi_v)),
+                            ("r<sub>e</sub> = α/g<sub>m</sub>", fmt_R(re_)),
+                            ("α = β/(β+1)", f"{alpha:.4f}"), ("r<sub>o</sub>", fmt_R(ro))]
+                st.markdown("| Parameter | Value |\n|:--|--:|\n" + "\n".join(f"| {a} | {b} |" for a, b in rows),
+                            unsafe_allow_html=True)
+                inf = float("inf")
+                if mos:
+                    Rin = {"CS": inf, "CD": inf, "CG": Rs + 1 / gm}[cfg]
+                    Rout = {"CS": Rd, "CD": (Rs / (1 + gm * Rs)), "CG": Rd}[cfg]
+                    rin_tex = {"CS": r"\infty", "CD": r"\infty", "CG": r"R_S+\tfrac{1}{g_m}"}[cfg]
+                    rout_tex = {"CS": "R_D", "CD": r"R_S\parallel\tfrac{1}{g_m}", "CG": "R_D"}[cfg]
+                else:
+                    Rce = RB + rpi_v + (beta + 1) * Rs
+                    Rin = {"CS": Rce, "CD": Rce, "CG": Rs + (RB + rpi_v) / (beta + 1)}[cfg]
+                    rx = (RB + rpi_v) / (beta + 1)
+                    Rout = {"CS": Rd, "CD": (Rs * rx / (Rs + rx) if Rs > 0 else 0.0), "CG": Rd}[cfg]
+                    rin_tex = {"CS": r"R_B+r_\pi+(\beta+1)R_E", "CD": r"R_B+r_\pi+(\beta+1)R_E",
+                               "CG": r"R_E+\frac{R_B+r_\pi}{\beta+1}"}[cfg]
+                    rout_tex = {"CS": "R_C", "CD": r"R_E\parallel\frac{R_B+r_\pi}{\beta+1}", "CG": "R_C"}[cfg]
+                st.markdown("**Results from the model** (r<sub>o</sub> neglected)", unsafe_allow_html=True)
+                st.latex(A_tex + rf"= {A_f:.2f}\ \text{{V/V}}")
+                if math.isfinite(Rin):
+                    st.latex(rf"R_{{in}}={rin_tex}=\text{{{fmt_R(Rin)}}}")
+                else:
+                    st.latex(r"R_{in}=\infty\quad\text{(no gate current)}")
+                st.latex(rf"R_{{out}}={rout_tex}=\text{{{fmt_R(Rout)}}}")
+                st.caption(f"Software check: slope of the transfer curve at Q = {slope:.2f} V/V "
+                           "(full nonlinear model, includes r_o). R_in is the resistance seen by v_i; "
+                           "R_out is seen at the v_o node with v_i = 0.")
 
     with st.expander("What to try", expanded=False):
         if cfg == "CS":
