@@ -176,6 +176,12 @@ def fmt_I(i_mA):
     return "≈ 0"
 
 
+def cur_label(sym, i_mA):
+    """'$I_D$ = 0.250 mA', or '$I_D$ ≈ 0' when the current is negligible."""
+    txt = fmt_I(i_mA)
+    return f"{sym} {txt}" if txt.startswith("≈") else f"{sym} = {txt}"
+
+
 def fmt_R(r_k):
     if not math.isfinite(r_k):
         return "∞"
@@ -207,7 +213,7 @@ def device_svg(fam, pol, VG, VD, I):
 @st.cache_data(max_entries=500, show_spinner=False)
 def amp_svg(fam, pol, cfg, sk, rk):
     s = dict(zip(("VDD", "Rd", "Rs", "RB", "vI", "VBIAS"), sk))
-    r = dict(zip(("VG", "VD", "VS", "vO"), rk))
+    r = dict(zip(("VG", "VD", "VS", "vO", "I"), rk))
     return svg_html(draw_amp(fam, pol, cfg, s, r), 340)
 
 
@@ -276,18 +282,23 @@ def draw_device(fam, pol, VG, VD, I):
     d += e
     d += elm.Line().left().at(getattr(e, ctl)).length(1.0)
     d += elm.Dot(open=True).label(f"{N['g']}  {VG:+.2f} V", loc="left")
-    term = "drain" if fam == "MOS" else "collector"
-    I_txt = f"$I_{N['I'][-1]}$ = {fmt_I(I)}\n({'into' if pol == 'n' else 'out of'} the {term})"
+    I_txt = cur_label(f"$I_{N['I'][-1]}$", I)
     if pol == "n":
-        d += elm.Line().up().at(getattr(e, top)).length(1.2).label(I_txt, loc="bottom", ofst=0.15)
+        ln = elm.Line().up().at(getattr(e, top)).length(1.6)
+        d += ln
         d += elm.Dot(open=True).label(f"{N['d']}  {VD:+.2f} V", loc="right")
+        # arrow beside the wire: current flows down, into the drain/collector
+        d += elm.CurrentLabel(top=False, length=0.8, ofst=0.3, reverse=True).at(ln).label(I_txt, loc="bottom")
         d += elm.Line().down().at(getattr(e, bot)).length(0.4)
         d += elm.Ground().label(f"{N['s']} (0 V)", loc="right")
     else:
         d += elm.Line().up().at(getattr(e, top)).length(0.4)
         d += elm.Vdd().label(f"{N['s']} = 0 V (reference)")
-        d += elm.Line().down().at(getattr(e, bot)).length(1.2).label(I_txt, loc="top", ofst=0.15)
+        ln = elm.Line().down().at(getattr(e, bot)).length(1.6)
+        d += ln
         d += elm.Dot(open=True).label(f"{N['d']}  {VD:+.2f} V", loc="right")
+        # arrow beside the wire: current flows down, out of the drain/collector
+        d += elm.CurrentLabel(top=True, length=0.8, ofst=0.3).at(ln).label(I_txt, loc="top")
     return d
 
 
@@ -319,6 +330,8 @@ def draw_amp(fam, pol, cfg, s, r):
     else:
         d += elm.Dot(open=True).label(vin_lbl, loc="top")
     rt = _res_or_wire(d, "down", Rtop, N["top"].replace("_", "_{") + "}", label_loc="bottom")
+    d += elm.CurrentLabel(top=False, length=0.8, ofst=0.45).at(rt).label(
+        cur_label(f"$I_{N['I'][-1]}$", abs(r["I"])), loc="top")
     top_node_V = r["VD"] if n else r["VS"]
     d += elm.Dot()
     out_top = (n and cfg != "CD") or ((not n) and cfg == "CD")
@@ -757,7 +770,7 @@ def render_tab2():
         rname = REGION_LABELS[cls]
         region_box(fam, r["region"], f"**{rname.capitalize()}**  ·  {N['I']} = {fmt_I(Iq)}  ·  v_O = {r['vO']:.2f} V")
         sk = tuple(round(s_amp[k], 3) for k in ("VDD", "Rd", "Rs", "RB", "vI", "VBIAS"))
-        rk = tuple(round(r[k], 2) for k in ("VG", "VD", "VS", "vO"))
+        rk = tuple(round(r[k], 2) for k in ("VG", "VD", "VS", "vO")) + (float(f"{Iq:.4g}"),)
         st.markdown(amp_svg(fam, pol, cfg, sk, rk), unsafe_allow_html=True)
 
     with col_plot:
